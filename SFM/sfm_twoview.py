@@ -65,7 +65,7 @@ def main():
     #  3. Match with Lowe's ratio test, only keep good points
     bf = cv2.BFMatcher(cv2.NORM_L2)
     knn = bf.knnMatch(des1, des2, k=2)
-    ratio = 0.7 # default
+    ratio = 0.9
     good = [m for m, n in knn if m.distance <ratio * n.distance]
     pts1 = np.float64([kp1[m.queryIdx].pt for m in good])
     pts2 = np.float64([kp2[m.trainIdx].pt for m in good])
