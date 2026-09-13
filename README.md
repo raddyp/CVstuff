@@ -1,2 +1,2 @@
 # CVstuff
-general spatial CV projects
+general  CV projects, 
