@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Pure incremental Structure-from-Motion (COLMAP-style) with a scipy bundle adjuster.
+"""Fast, simplified incremental SfM (speed-focused variant bust more sophisticated than sfm_twoview).
 
-Pipeline: SIFT features -> ratio-test matching + Fundamental RANSAC -> feature tracks
-(union-find) -> two-view init (Essential) -> incremental PnP registration ->
-multi-view triangulation -> scipy.optimize.least_squares bundle adjustment -> .ply.
-
-Front-end geometry uses OpenCV; the bundle adjustment core is hand-rolled on scipy.
+Same core (SIFT -> windowed matching + Fundamental RANSAC -> tracks -> two-view
+init -> incremental PnP -> triangulation -> scipy BA -> .ply), but trimmed for
+speed:
+  * lighter defaults (smaller images, fewer features, narrower match window)
+  * BA runs infrequently during growth and is BA-only (no mid-loop prune)
+  * ONE final refinement pass (BA -> prune -> re-triangulate -> BA)
+  
+tradeoff: fewer BA/prune passes = faster but a bit more drift / higher RMS.
+youc an increase the BA/prune passes for more detailed/accurate result
 """
 
 import argparse
@@ -18,10 +22,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
 
-
-# --------------------------------------------------------------------------- #
 # IO / features
-# --------------------------------------------------------------------------- #
 def load_images(img_dir, stride, max_dim):
     paths = sorted(glob.glob(os.path.join(img_dir, "*.jpg")) +
                    glob.glob(os.path.join(img_dir, "*.png")))
@@ -54,10 +55,8 @@ def detect(grays, nfeatures):
     return kpts, descs
 
 
-# --------------------------------------------------------------------------- #
-# matching (sequential window with wraparound = good for turntable video)
-# --------------------------------------------------------------------------- #
-def match_pairs(kpts, descs, K, window, ratio):
+# feature matching between frames
+def match_pairs(kpts, descs, window, ratio):
     n = len(descs)
     bf = cv2.BFMatcher(cv2.NORM_L2)
     pair_matches = {}
@@ -69,7 +68,8 @@ def match_pairs(kpts, descs, K, window, ratio):
         if i == j:
             continue
         raw = bf.knnMatch(descs[i], descs[j], k=2)
-        good = [(m.queryIdx, m.trainIdx) for m, n2 in raw if m.distance < ratio * n2.distance]
+        good = [(m.queryIdx, m.trainIdx)
+                for m, n2 in raw if m.distance < ratio * n2.distance]
         if len(good) < 30:
             continue
         good = np.array(good)
@@ -85,10 +85,7 @@ def match_pairs(kpts, descs, K, window, ratio):
     print(f"[match] {len(pair_matches)} verified pairs")
     return pair_matches
 
-
-# --------------------------------------------------------------------------- #
-# tracks via union-find
-# --------------------------------------------------------------------------- #
+# featiure tracks via union-find
 class UF:
     def __init__(self, n):
         self.p = list(range(n))
@@ -119,13 +116,10 @@ def build_tracks(kpts, pair_matches):
             r = uf.find(offsets[i] + k)
             groups.setdefault(r, []).append((i, k))
 
-    tracks = []            # list of list[(img, kp_idx)]
-    obs_to_track = {}      # (img, kp_idx) -> track_id
+    tracks, obs_to_track = [], {}
     for obs in groups.values():
         imgs = [o[0] for o in obs]
-        if len(imgs) != len(set(imgs)):   # drop tracks with 2 feats in one image
-            continue
-        if len(obs) < 2:
+        if len(imgs) != len(set(imgs)) or len(obs) < 2:
             continue
         tid = len(tracks)
         tracks.append(obs)
@@ -136,9 +130,7 @@ def build_tracks(kpts, pair_matches):
     return tracks, obs_to_track
 
 
-# --------------------------------------------------------------------------- #
-# geometry helpers
-# --------------------------------------------------------------------------- #
+# geometry 
 def proj_matrix(K, R, t):
     return K @ np.hstack([R, t.reshape(3, 1)])
 
@@ -183,9 +175,8 @@ def max_tri_angle(cameras, views, X):
     return best
 
 
-# --------------------------------------------------------------------------- #
-# bundle adjustment (scipy)
-# --------------------------------------------------------------------------- #
+
+# bundle adjustment (scipy) 
 def rotate(pts, rvecs):
     theta = np.linalg.norm(rvecs, axis=1)[:, None]
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -254,19 +245,15 @@ def run_ba(cameras, reg_order, points3d, tracks, kpts, K, ftol=1e-4):
     p = res.x
     cams = p[:len(cam_ids) * 6].reshape(-1, 6)
     for c in cam_ids:
-        rvec = cams[cam_pos[c], :3]
-        R, _ = cv2.Rodrigues(rvec)
+        R, _ = cv2.Rodrigues(cams[cam_pos[c], :3])
         cameras[c] = (R, cams[cam_pos[c], 3:6].copy())
     pts = p[len(cam_ids) * 6:].reshape(-1, 3)
     for tid in pt_ids:
         points3d[tid] = pts[pt_pos[tid]]
-    rms = np.sqrt(np.mean(res.fun ** 2))
-    return rms
+    return np.sqrt(np.mean(res.fun ** 2))
 
 
-# --------------------------------------------------------------------------- #
 # incremental SfM
-# --------------------------------------------------------------------------- #
 def two_view_init(pair_matches, kpts, K, obs_to_track, tracks):
     best = None
     for (i, j), m in pair_matches.items():
@@ -329,9 +316,6 @@ def triangulate_new(cameras, reg, points3d, tracks, kpts, K,
 
 
 def prune_points(cameras, points3d, tracks, kpts, K, max_err, min_angle):
-    """COLMAP-style: drop points that reproject badly, go behind a camera,
-    or have too small a triangulation angle. Pruned points can be
-    re-triangulated later once more cameras are added."""
     removed = 0
     for tid, X in points3d.items():
         if X is None:
@@ -383,9 +367,7 @@ def register_next(cameras, reg, points3d, tracks, obs_to_track, kpts, K):
     return img, cnt, len(inliers)
 
 
-# --------------------------------------------------------------------------- #
 # output
-# --------------------------------------------------------------------------- #
 def filter_points(points3d, tracks, cameras, kpts, K, max_err, min_views):
     keep = {}
     for tid, X in points3d.items():
@@ -403,7 +385,7 @@ def filter_points(points3d, tracks, cameras, kpts, K, max_err, min_views):
     return keep
 
 
-def save_ply(path, points3d, tracks, images, kpts, cameras, K):
+def save_ply(path, points3d, tracks, images, kpts):
     xyz, rgb = [], []
     for tid, X in points3d.items():
         img, k = tracks[tid][0]
@@ -415,7 +397,6 @@ def save_ply(path, points3d, tracks, images, kpts, cameras, K):
         xyz.append(X)
         rgb.append((r, g, b))
     xyz = np.array(xyz)
-    # drop statistical outliers (far from centroid)
     c = np.median(xyz, axis=0)
     d = np.linalg.norm(xyz - c, axis=1)
     thr = np.median(d) + 3 * (np.percentile(d, 75) - np.percentile(d, 25) + 1e-9)
@@ -433,17 +414,50 @@ def save_ply(path, points3d, tracks, images, kpts, cameras, K):
     return len(xyz)
 
 
+def save_ply_full(path, points3d, tracks, images, kpts):
+    """Write EVERY triangulated point, completely unfiltered.
+
+    Unlike save_ply, this has no statistical outlier removal and expects
+    the raw points3d dict """
+    
+    xyz, rgb = [], []
+    for tid, X in points3d.items():
+        if X is None:
+            continue
+        img, k = tracks[tid][0]
+        px = kpts[img][k]
+        h, w = images[img].shape[:2]
+        u = int(np.clip(px[0], 0, w - 1))
+        v = int(np.clip(px[1], 0, h - 1))
+        b, g, r = images[img][v, u]
+        xyz.append(X)
+        rgb.append((r, g, b))
+    with open(path, "w") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(xyz)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        f.write("end_header\n")
+        for (x, y, z), (r, g, b) in zip(xyz, rgb):
+            f.write(f"{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n")
+    print(f"[ply-full] wrote {len(xyz)} points -> {path}")
+    return len(xyz)
+
+
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--images", required=True)
-    ap.add_argument("--out", default="reconstruction.ply")
+    ap.add_argument("--out", default="reconstruction_fast.ply")
+    ap.add_argument("--out-full", default=None,
+                    help="path for the full unfiltered cloud "
+                         "(default: <out>_full.ply)")
     ap.add_argument("--stride", type=int, default=5)
-    ap.add_argument("--max-dim", type=int, default=1024)
-    ap.add_argument("--nfeatures", type=int, default=8000)
-    ap.add_argument("--window", type=int, default=4)
+    ap.add_argument("--max-dim", type=int, default=800)      # was 1024
+    ap.add_argument("--nfeatures", type=int, default=3000)   # was 8000
+    ap.add_argument("--window", type=int, default=3)         # was 4
     ap.add_argument("--ratio", type=float, default=0.75)
-    ap.add_argument("--ba-every", type=int, default=5)
+    ap.add_argument("--ba-every", type=int, default=10)      # was 5
     args = ap.parse_args()
 
     t0 = time.time()
@@ -454,13 +468,14 @@ def main():
     print(f"[intrinsics] f={f:.1f} (assumed), principal=({w/2:.0f},{h/2:.0f})")
 
     kpts, descs = detect(grays, args.nfeatures)
-    pair_matches = match_pairs(kpts, descs, K, args.window, args.ratio)
+    pair_matches = match_pairs(kpts, descs, args.window, args.ratio)
     tracks, obs_to_track = build_tracks(kpts, pair_matches)
 
     cameras, points3d, reg = two_view_init(pair_matches, kpts, K, obs_to_track, tracks)
     reg_order = list(reg)
     run_ba(cameras, reg_order, points3d, tracks, kpts, K)
 
+    # Incremental growth: BA-only.
     since_ba = 0
     while True:
         r = register_next(cameras, reg, points3d, tracks, obs_to_track, kpts, K)
@@ -474,29 +489,25 @@ def main():
               f"+{added} pts | total {sum(1 for v in points3d.values() if v is not None)}")
         if since_ba >= args.ba_every:
             rms = run_ba(cameras, reg_order, points3d, tracks, kpts, K)
-            rm = prune_points(cameras, points3d, tracks, kpts, K,
-                              max_err=6.0, min_angle=1.5)
-            triangulate_new(cameras, reg, points3d, tracks, kpts, K)
-            print(f"      [BA] rms={rms:.3f}px  cams={len(reg_order)}  pruned={rm}")
+            print(f"      [BA] rms={rms:.3f}px  cams={len(reg_order)}")
             since_ba = 0
 
-    # Final refinement: iterate BA -> prune outliers -> re-triangulate.
-    for it in range(4):
-        rms = run_ba(cameras, reg_order, points3d, tracks, kpts, K, ftol=1e-6)
-        rm = prune_points(cameras, points3d, tracks, kpts, K,
+    # single final refinement pass (drift safety-net).
+    rms = run_ba(cameras, reg_order, points3d, tracks, kpts, K, ftol=1e-6)
+    rm = prune_points(cameras, points3d, tracks, kpts, K, max_err=4.0, min_angle=1.5)
+    add = triangulate_new(cameras, reg, points3d, tracks, kpts, K,
                           max_err=4.0, min_angle=1.5)
-        add = triangulate_new(cameras, reg, points3d, tracks, kpts, K,
-                              max_err=4.0, min_angle=1.5)
-        npts = sum(1 for v in points3d.values() if v is not None)
-        print(f"[final {it}] rms={rms:.3f}px  pruned={rm}  +{add}  pts={npts}")
+    rms = run_ba(cameras, reg_order, points3d, tracks, kpts, K, ftol=1e-6)
+    print(f"[final] rms={rms:.3f}px  pruned={rm}  +{add}")
 
     pts = filter_points(points3d, tracks, cameras, kpts, K, max_err=2.0, min_views=2)
     print(f"[filter] {len(pts)} points kept (of "
           f"{sum(1 for v in points3d.values() if v is not None)})")
-    save_ply(args.out, pts, tracks, images, kpts, cameras, K)
+    save_ply(args.out, pts, tracks, images, kpts)
     print(f"[done] {len(reg)} / {len(images)} images registered in "
           f"{time.time()-t0:.1f}s")
-
+    out_full = args.out_full or os.path.splitext(args.out)[0] + "_full.ply"
+    save_ply_full(out_full, points3d, tracks, images, kpts)
 
 if __name__ == "__main__":
     main()
