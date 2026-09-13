@@ -1,0 +1,7 @@
+epoch       : 4
+train_loss  : 1.5001
+RMSE_mm     : 1258.6524
+MAE_mm      : 526.6911
+iRMSE       : 2.9049
+iMAE        : 1.7226
+delta1      : 0.9964
